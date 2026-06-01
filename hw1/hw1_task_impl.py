@@ -36,11 +36,12 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        acc = x
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
-
+    return torch.compile(fn) if compiled else fn
 
 # ============================================================================
 # Part 2: Benchmarking
@@ -61,9 +62,20 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    times = []
 
+    for _ in range(rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        fn(*args)
+        end.record()
+
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+
+    return torch.median(torch.tensor(times)).item()
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
 # Count every arithmetic operation performed inside the loop (careful: each
@@ -82,8 +94,18 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    total_flops = num_elements * num_ops * 2
+
+    if variant == "compiled":
+        bytes_moved = num_elements * 2 * bytes_per_element
+    elif variant == "eager":
+        bytes_moved = num_elements * num_ops * 6 * bytes_per_element
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+
+    ai = total_flops / bytes_moved
+    achieved_flops = total_flops / (ms * 1e-3)
+
     return total_flops, ai, achieved_flops
 
 
@@ -95,13 +117,36 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
-#
+
+# Q1 Answer:
+# The compiled element-wise operations get faster in terms of FLOP/s because they do much more arithmetic while taking almost the same amount of time.
+# From the results, 1 ops and 64 ops both took about 0.216 ms, but 64 ops performs far more work per element. Since torch.compile fuses the operations, the tensor is read and written roughly once, while the GPU does more computation before writing the result back.
+# So the memory movement stays almost the same, but the useful work increases. That raises arithmetic intensity and allows the GPU to achieve much higher performance, moving from 0.62 TFLOP/s at 1 ops to 39.84 TFLOP/s at 64 ops.
+
+
+
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
+
+# Q2 Answer:
+# Reason 1 : 1024×1024 is relatively small for an H100, so the matmul may not fully keep the GPU busy. That is why it only reached 31.96 TFLOP/s.
+# Reason 2 : The 128 ops compiled element-wise kernel is simple, large, and fused, so it does lots of work efficiently with little extra memory traffic. That is why it reached 52.96 TFLOP/s.
+# So the key point is: this result does not mean element-wise operations are generally better than matmul. It means this specific small matmul did not use the H100 as fully as the large fused element-wise workload.
+
+
 #
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
+
+# Q3 Answer:
+# Between 64 ops and 128 ops, runtime increased from 0.216 ms to 0.324 ms.
+# This suggests the bottleneck is shifting from memory bandwidth to compute. At 64 ops, the arithmetic intensity was 16 FLOP/Byte, but at 128 ops it rose to 32 FLOP/Byte, which is above the H100 ridge point of 20 FLOP/Byte.
+# So the GPU is now doing enough arithmetic that compute capacity, not memory movement, is becoming the limiting factor.
+
 #
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+# The eager ops-K points look different because eager PyTorch does not fuse the operations. Each multiply and add creates extra intermediate tensors and extra memory traffic.
+# In our results, the eager operations stayed at about 0.0833 FLOP/Byte and only around 0.26 to 0.30 TFLOP/s, even as num_ops increased.
+# The compiled operations were fused, so they reused data more efficiently and did more work per memory access. That is why compiled performance rose up to 52.96 TFLOP/s, while eager stayed low
